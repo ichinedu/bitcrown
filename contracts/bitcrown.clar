@@ -309,3 +309,99 @@
     )
   )
 )
+
+;; LIQUIDATION SYSTEM
+
+;; Liquidate undercollateralized positions
+(define-public (liquidate-position (target-user principal))
+  (let (
+      (user-debt (unwrap! (calculate-user-debt target-user) ERR_CONTRACT_CALL_FAILED))
+      (collateral-position (unwrap! (map-get? user-collateral-positions { account: target-user })
+        ERR_CANNOT_BE_LIQUIDATED
+      ))
+      (collateral-amount (get sbtc-amount collateral-position))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) ERR_PRICE_FEED_ERROR))
+      (collateral-value (* collateral-amount sbtc-price))
+      (liquidation-ratio (* user-debt LIQUIDATION_THRESHOLD))
+    )
+    (update-interest-accrual)
+
+    (asserts! (> user-debt u0) ERR_CANNOT_BE_LIQUIDATED)
+    (asserts! (<= (* collateral-value u100) liquidation-ratio)
+      ERR_CANNOT_BE_LIQUIDATED
+    )
+
+    (var-set total-sbtc-collateral
+      (if (>= (var-get total-sbtc-collateral) collateral-amount)
+        (- (var-get total-sbtc-collateral) collateral-amount)
+        u0
+      ))
+    (var-set total-stx-borrows
+      (if (>= (var-get total-stx-borrows) user-debt)
+        (- (var-get total-stx-borrows) user-debt)
+        u0
+      ))
+
+    (map-delete user-borrow-positions { account: target-user })
+    (map-delete user-collateral-positions { account: target-user })
+
+    (ok true)
+  )
+)
+
+;; INTERNAL HELPER FUNCTIONS
+
+;; Get blockchain timestamp
+(define-private (get-current-timestamp)
+  (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))
+)
+
+;; Update global yield calculations for lenders
+(define-private (update-interest-accrual)
+  (let (
+      (current-time (get-current-timestamp))
+      (last-update (var-get last-interest-update))
+    )
+    (if (and (> current-time last-update) (> (var-get total-stx-deposits) u0))
+      (let (
+          (time-elapsed (- current-time last-update))
+          (total-borrows (var-get total-stx-borrows))
+          (total-deposits (var-get total-stx-deposits))
+          (interest-earned (* (* total-borrows ANNUAL_INTEREST_RATE)
+            (/ time-elapsed SECONDS_PER_YEAR)
+          ))
+          (yield-per-token (/ (* interest-earned BASIS_POINTS) total-deposits))
+        )
+        (var-set last-interest-update current-time)
+        (var-set cumulative-yield-index
+          (+ (var-get cumulative-yield-index) yield-per-token)
+        )
+        true
+      )
+      true
+    )
+  )
+)
+
+;; PUBLIC QUERY FUNCTIONS
+
+;; Get user's sBTC collateral balance
+(define-read-only (get-user-collateral (account principal))
+  (default-to u0
+    (get sbtc-amount (map-get? user-collateral-positions { account: account }))
+  )
+)
+
+;; Get user's STX deposit balance
+(define-read-only (get-user-deposits (account principal))
+  (default-to u0
+    (get stx-amount (map-get? user-deposit-positions { account: account }))
+  )
+)
+
+;; Get user's outstanding borrow balance
+(define-read-only (get-user-borrows (account principal))
+  (default-to u0
+    (get stx-amount (map-get? user-borrow-positions { account: account }))
+  )
+)
