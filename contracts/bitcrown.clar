@@ -196,3 +196,116 @@
     )
   )
 )
+
+;; COLLATERALIZED BORROWING FUNCTIONS
+
+;; Borrow STX against sBTC collateral
+(define-public (borrow-stx
+    (collateral-amount uint)
+    (borrow-amount uint)
+  )
+  (let (
+      (caller tx-sender)
+      (existing-collateral (map-get? user-collateral-positions { account: caller }))
+      (current-collateral (default-to u0 (get sbtc-amount existing-collateral)))
+      (new-total-collateral (+ current-collateral collateral-amount))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) ERR_PRICE_FEED_ERROR))
+      (collateral-value (* new-total-collateral sbtc-price))
+      (max-borrowable (/ (* collateral-value LOAN_TO_VALUE_RATIO) u100))
+      (current-debt (unwrap! (calculate-user-debt caller) ERR_CONTRACT_CALL_FAILED))
+      (new-total-debt (+ current-debt borrow-amount))
+    )
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> collateral-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (> borrow-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (<= new-total-debt max-borrowable) ERR_EXCEEDED_MAX_BORROW)
+
+    (update-interest-accrual)
+
+    (map-set user-borrow-positions { account: caller } {
+      stx-amount: new-total-debt,
+      last-interest-accrual: (get-current-timestamp),
+    })
+
+    (var-set total-stx-borrows (+ (var-get total-stx-borrows) borrow-amount))
+
+    (map-set user-collateral-positions { account: caller } { sbtc-amount: new-total-collateral })
+
+    (var-set total-sbtc-collateral
+      (+ (var-get total-sbtc-collateral) collateral-amount)
+    )
+
+    (try! (as-contract (stx-transfer? borrow-amount tx-sender caller)))
+    (ok true)
+  )
+)
+
+;; Repay borrowed STX and manage collateral
+(define-public (repay-loan (repay-amount uint))
+  (let (
+      (caller tx-sender)
+      (borrow-position (unwrap! (map-get? user-borrow-positions { account: caller })
+        ERR_INSUFFICIENT_BALANCE
+      ))
+      (borrowed-principal (get stx-amount borrow-position))
+      (total-debt (unwrap! (calculate-user-debt caller) ERR_CONTRACT_CALL_FAILED))
+      (collateral-position (map-get? user-collateral-positions { account: caller }))
+      (collateral-amount (default-to u0 (get sbtc-amount collateral-position)))
+    )
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> repay-amount u0) ERR_ZERO_AMOUNT)
+
+    (update-interest-accrual)
+    (try! (stx-transfer? repay-amount caller (as-contract tx-sender)))
+
+    (let ((remaining-debt (if (>= repay-amount total-debt)
+        u0
+        (- total-debt repay-amount)
+      )))
+      (if (is-eq remaining-debt u0)
+        (begin
+          (map-delete user-collateral-positions { account: caller })
+          (map-delete user-borrow-positions { account: caller })
+
+          (var-set total-sbtc-collateral
+            (if (>= (var-get total-sbtc-collateral) collateral-amount)
+              (- (var-get total-sbtc-collateral) collateral-amount)
+              u0
+            ))
+          (var-set total-stx-borrows
+            (if (>= (var-get total-stx-borrows) borrowed-principal)
+              (- (var-get total-stx-borrows) borrowed-principal)
+              u0
+            ))
+        )
+        (map-set user-borrow-positions { account: caller } {
+          stx-amount: remaining-debt,
+          last-interest-accrual: (get-current-timestamp),
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Calculate total debt including accrued interest
+(define-read-only (calculate-user-debt (account principal))
+  (let (
+      (borrow-position (map-get? user-borrow-positions { account: account }))
+      (borrowed-amount (default-to u0 (get stx-amount borrow-position)))
+      (last-accrual (default-to u0 (get last-interest-accrual borrow-position)))
+      (current-time (get-current-timestamp))
+    )
+    (if (and (> borrowed-amount u0) (> current-time last-accrual))
+      (let (
+          (time-elapsed (- current-time last-accrual))
+          (interest-rate-per-second (/ ANNUAL_INTEREST_RATE SECONDS_PER_YEAR))
+          (interest-factor (+ u100 (/ (* interest-rate-per-second time-elapsed) u100)))
+          (total-debt (/ (* borrowed-amount interest-factor) u100))
+        )
+        (ok total-debt)
+      )
+      (ok borrowed-amount)
+    )
+  )
+)
