@@ -405,3 +405,30 @@
     (get stx-amount (map-get? user-borrow-positions { account: account }))
   )
 )
+
+;; Calculate user's position health factor
+(define-read-only (get-user-health-factor (account principal))
+  (let (
+      (collateral-amount (get-user-collateral account))
+      (debt-amount (unwrap! (calculate-user-debt account) (ok u0)))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) (ok u0)))
+      (collateral-value (* collateral-amount sbtc-price))
+    )
+    (if (is-eq debt-amount u0)
+      (ok u999999) ;; Maximum health for zero debt
+      (ok (/ (* collateral-value u100) debt-amount))
+    )
+  )
+)
+
+;; Get comprehensive protocol metrics
+(define-read-only (get-protocol-stats)
+  {
+    total-sbtc-collateral: (var-get total-sbtc-collateral),
+    total-stx-deposits: (var-get total-stx-deposits),
+    total-stx-borrows: (var-get total-stx-borrows),
+    cumulative-yield-index: (var-get cumulative-yield-index),
+    current-sbtc-price: (var-get sbtc-price-in-stx),
+    protocol-paused: (var-get protocol-paused),
+  }
+)
